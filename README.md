@@ -28,7 +28,7 @@
     clone := buf.Clone()
 ```
 
-## read int64 value from byte buffer
+## read 8 bytes array as int64 value from byte buffer
 
 ```go
     buf := EmptyByteBuf()
