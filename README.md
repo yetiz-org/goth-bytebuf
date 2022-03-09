@@ -19,7 +19,7 @@
 ## write int64 value to byte buffer
 
 ```go
-    buf.WriteUInt64(int64(12345))
+    buf.WriteInt64(int64(12345))
 ```
 
 ## make a clone of current readable bytes
@@ -32,7 +32,7 @@
 
 ```go
     buf := EmptyByteBuf()
-    buf.WriteUInt64(int64(12345)) // readable bytes len = 8
+    buf.WriteInt64(int64(12345)) // readable bytes len = 8
     v := buf.ReadInt64() // v = int64(12345)
 ```
 
