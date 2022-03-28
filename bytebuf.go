@@ -11,6 +11,7 @@ type ByteBuf interface {
 	io.Writer
 	io.Reader
 	io.Closer
+	io.WriterAt
 	ReaderIndex() int
 	WriterIndex() int
 	MarkReaderIndex() ByteBuf
@@ -118,6 +119,24 @@ func (b *DefaultByteBuf) Read(p []byte) (n int, err error) {
 	return cpLen, nil
 }
 
+func (b *DefaultByteBuf) WriteAt(p []byte, offset int64) (n int, err error) {
+	pl := len(p)
+	if pl == 0 {
+		return 0, nil
+	}
+
+	expLen := int(offset) + pl
+	if expLen > b.Cap() {
+		b.prepare(expLen - b.Cap())
+	}
+	if expLen > b.writerIndex {
+		b.writerIndex = expLen
+	}
+
+	copy(b.buf[offset:], p)
+	return pl, nil
+}
+
 func (b *DefaultByteBuf) Close() error {
 	b.Reset()
 	return nil
@@ -154,7 +173,7 @@ func (b *DefaultByteBuf) ResetWriterIndex() ByteBuf {
 }
 
 func (b *DefaultByteBuf) Reset() ByteBuf {
-	b.buf = b.buf[:0]
+	b.buf = []byte{}
 	b.readerIndex = 0
 	b.writerIndex = 0
 	b.prevReaderIndex = 0

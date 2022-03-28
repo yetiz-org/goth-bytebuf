@@ -7,6 +7,15 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestDefaultByteBuf_WriteAt(t *testing.T) {
+	buf := EmptyByteBuf()
+	buf.WriteAt([]byte{1}, 0)
+	buf.WriteAt([]byte{1, 1, 1}, 5)
+	buf.WriteAt([]byte{2}, 1)
+	buf.WriteAt([]byte{3}, 2)
+	assert.Equal(t, []byte{1, 2, 3, 0, 0, 1, 1, 1}, buf.Bytes())
+}
+
 func TestDefaultByteBuf_WriteInt16(t *testing.T) {
 	buf := EmptyByteBuf()
 	buf.WriteInt16(math.MaxInt16)
