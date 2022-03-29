@@ -195,23 +195,18 @@ func (b *DefaultByteBuf) Cap() int {
 
 func (b *DefaultByteBuf) Grow(v int) ByteBuf {
 	tb := make([]byte, b.Cap()+v)
+	var offset int
 	if b.prevReaderIndex == 0 {
-		offset := b.readerIndex - b.prevReaderIndex
-		copy(tb, b.buf[b.readerIndex:])
-		b.readerIndex -= offset
-		b.writerIndex -= offset
-		if b.prevWriterIndex > 0 {
-			b.prevWriterIndex -= offset
-		}
+		offset = b.readerIndex
 	} else {
-		copy(tb, b.buf[b.prevReaderIndex:])
-		offset := b.prevReaderIndex
+		offset = b.prevReaderIndex
 		b.prevReaderIndex = 0
-		b.readerIndex -= offset
-		b.writerIndex -= offset
-		if b.prevWriterIndex > 0 {
-			b.prevWriterIndex -= offset
-		}
+	}
+	copy(tb, b.buf[offset:])
+	b.readerIndex -= offset
+	b.writerIndex -= offset
+	if b.prevWriterIndex > 0 {
+		b.prevWriterIndex -= offset
 	}
 
 	b.buf = tb
