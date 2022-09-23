@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"unsafe"
 )
 
 type ByteBuf interface {
@@ -261,7 +262,7 @@ func (b *DefaultByteBuf) WriteReader(reader io.Reader) ByteBuf {
 }
 
 func (b *DefaultByteBuf) WriteString(s string) ByteBuf {
-	b.WriteBytes([]byte(s))
+	b.WriteBytes(*(*[]byte)(unsafe.Pointer(&s)))
 	return b
 }
 
