@@ -1,4 +1,4 @@
-module github.com/kklab-com/goth-bytebuf
+module github.com/yetiz-org/goth-bytebuf
 
 go 1.18
 
