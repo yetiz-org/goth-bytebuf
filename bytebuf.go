@@ -2,12 +2,17 @@ package buf
 
 import (
 	"encoding/binary"
-	"fmt"
+	"errors"
 	"io"
 	"math"
-	"unsafe"
 )
 
+// ByteBuf defines a byte buffer interface that is NOT concurrent-safe.
+//
+// Notes:
+// - Unless specified otherwise, out-of-bound or invalid operations will panic (preserving the original semantics).
+// - Bytes returns a mutable view; writing to the returned slice will mutate the internal buffer.
+// - Use BytesCopy to obtain an immutable copy if you need isolation from internal mutations.
 type ByteBuf interface {
 	io.Writer
 	io.Reader
@@ -21,9 +26,15 @@ type ByteBuf interface {
 	ResetWriterIndex() ByteBuf
 	Reset() ByteBuf
 	Bytes() []byte
+	BytesCopy() []byte
 	ReadableBytes() int
 	Cap() int
 	Grow(v int) ByteBuf
+	// Compact moves the readable region to the beginning of the buffer and adjusts indices (including marked indices).
+	Compact() ByteBuf
+	// EnsureCapacity guarantees that at least n bytes of writable space are available.
+	// It first tries to compact; if still insufficient, it grows using the existing doubling policy and compacts again.
+	EnsureCapacity(n int) ByteBuf
 	Skip(v int) ByteBuf
 	Clone() ByteBuf
 	WriteByte(c byte) ByteBuf
@@ -69,8 +80,8 @@ type ByteBuf interface {
 	ReadFloat64LE() float64
 }
 
-var ErrNilObject = fmt.Errorf("nil object")
-var ErrInsufficientSize = fmt.Errorf("insufficient size")
+var ErrNilObject = errors.New("nil object")
+var ErrInsufficientSize = errors.New("insufficient size")
 
 func NewByteBuf(bs []byte) ByteBuf {
 	buf := &DefaultByteBuf{}
@@ -126,7 +137,14 @@ func (b *DefaultByteBuf) WriteAt(p []byte, offset int64) (n int, err error) {
 		return 0, nil
 	}
 
-	expLen := int(offset) + pl
+	// Validate offset and prevent int overflow when converting to index
+	maxInt := int(^uint(0) >> 1)
+	if offset < 0 || offset > int64(maxInt-pl) {
+		panic(ErrInsufficientSize)
+	}
+	off := int(offset)
+
+	expLen := off + pl
 	if expLen > b.Cap() {
 		b.prepare(expLen - b.Cap())
 	}
@@ -134,7 +152,7 @@ func (b *DefaultByteBuf) WriteAt(p []byte, offset int64) (n int, err error) {
 		b.writerIndex = expLen
 	}
 
-	copy(b.buf[offset:], p)
+	copy(b.buf[off:], p)
 	return pl, nil
 }
 
@@ -183,7 +201,76 @@ func (b *DefaultByteBuf) Reset() ByteBuf {
 }
 
 func (b *DefaultByteBuf) Bytes() []byte {
+    // Returns a mutable view of the readable region.
+    // Mutating the returned slice will mutate the internal buffer directly.
 	return b.buf[b.readerIndex:b.writerIndex]
+}
+
+func (b *DefaultByteBuf) BytesCopy() []byte {
+    // Returns a copy of the readable region. Modifying the returned slice will not affect the internal buffer.
+	if b.readerIndex == b.writerIndex {
+		return []byte{}
+	}
+	cp := make([]byte, b.writerIndex-b.readerIndex)
+	copy(cp, b.buf[b.readerIndex:b.writerIndex])
+	return cp
+}
+
+// Compact moves the readable region to the beginning of the buffer and adjusts indices (including marked indices).
+func (b *DefaultByteBuf) Compact() ByteBuf {
+	if b.readerIndex == 0 {
+		return b
+	}
+	readable := b.ReadableBytes()
+	if readable > 0 {
+		copy(b.buf[0:], b.buf[b.readerIndex:b.writerIndex])
+	}
+	shift := b.readerIndex
+	b.readerIndex = 0
+	b.writerIndex = readable
+	if b.prevReaderIndex > 0 {
+		if b.prevReaderIndex >= shift {
+			b.prevReaderIndex -= shift
+		} else {
+			b.prevReaderIndex = 0
+		}
+	}
+	if b.prevWriterIndex > 0 {
+		if b.prevWriterIndex >= shift {
+			b.prevWriterIndex -= shift
+		} else {
+			b.prevWriterIndex = 0
+		}
+	}
+	return b
+}
+
+// EnsureCapacity guarantees that at least n bytes of writable space are available.
+// It first tries to compact; if still insufficient, it grows using the existing doubling policy and compacts again.
+func (b *DefaultByteBuf) EnsureCapacity(n int) ByteBuf {
+	if n < 0 {
+		panic(ErrInsufficientSize)
+	}
+	if n == 0 {
+		return b
+	}
+	if b.writerIndex+n <= b.Cap() {
+		return b
+	}
+    // First try to compact if total capacity can satisfy after compaction
+    if b.ReadableBytes()+n <= b.Cap() {
+        return b.Compact()
+    }
+    // Need to grow: preserve existing doubling growth policy
+    required := b.ReadableBytes() + n
+    if b.Cap() == 0 {
+        b.Grow(32)
+    }
+    for b.Cap() < required {
+        b.Grow(b.Cap())
+    }
+    // Grow() already compacts by moving readable bytes to the start; avoid redundant copy.
+    return b
 }
 
 func (b *DefaultByteBuf) ReadableBytes() int {
@@ -252,17 +339,35 @@ func (b *DefaultByteBuf) WriteReader(reader io.Reader) ByteBuf {
 		panic(ErrNilObject)
 	}
 
-	if bs, err := io.ReadAll(reader); err != nil {
-		panic(err)
-	} else {
-		b.WriteBytes(bs)
+	// Chunked copy to avoid unbounded memory growth
+	tmp := make([]byte, 32*1024)
+	for {
+		n, err := reader.Read(tmp)
+		if n > 0 {
+			b.WriteBytes(tmp[:n])
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			panic(err)
+		}
+		if n == 0 { // defensive break in case of weird readers
+			break
+		}
 	}
 
 	return b
 }
 
 func (b *DefaultByteBuf) WriteString(s string) ByteBuf {
-	b.WriteBytes(*(*[]byte)(unsafe.Pointer(&s)))
+	sl := len(s)
+	if sl == 0 {
+		return b
+	}
+	b.prepare(sl)
+	copy(b.buf[b.writerIndex:], s)
+	b.writerIndex += sl
 	return b
 }
 
@@ -282,42 +387,37 @@ func (b *DefaultByteBuf) WriteInt64(v int64) ByteBuf {
 }
 
 func (b *DefaultByteBuf) WriteUInt16(v uint16) ByteBuf {
-	bs := make([]byte, 2)
-	binary.BigEndian.PutUint16(bs, v)
-	b.prepare(len(bs))
-	b.WriteBytes(bs)
+	b.prepare(2)
+	binary.BigEndian.PutUint16(b.buf[b.writerIndex:], v)
+	b.writerIndex += 2
 	return b
 }
 
 func (b *DefaultByteBuf) WriteUInt32(v uint32) ByteBuf {
-	bs := make([]byte, 4)
-	binary.BigEndian.PutUint32(bs, v)
-	b.prepare(len(bs))
-	b.WriteBytes(bs)
+	b.prepare(4)
+	binary.BigEndian.PutUint32(b.buf[b.writerIndex:], v)
+	b.writerIndex += 4
 	return b
 }
 
 func (b *DefaultByteBuf) WriteUInt64(v uint64) ByteBuf {
-	bs := make([]byte, 8)
-	binary.BigEndian.PutUint64(bs, v)
-	b.prepare(len(bs))
-	b.WriteBytes(bs)
+	b.prepare(8)
+	binary.BigEndian.PutUint64(b.buf[b.writerIndex:], v)
+	b.writerIndex += 8
 	return b
 }
 
 func (b *DefaultByteBuf) WriteFloat32(v float32) ByteBuf {
-	bs := make([]byte, 4)
-	binary.BigEndian.PutUint32(bs, math.Float32bits(v))
-	b.prepare(len(bs))
-	b.WriteBytes(bs)
+	b.prepare(4)
+	binary.BigEndian.PutUint32(b.buf[b.writerIndex:], math.Float32bits(v))
+	b.writerIndex += 4
 	return b
 }
 
 func (b *DefaultByteBuf) WriteFloat64(v float64) ByteBuf {
-	bs := make([]byte, 8)
-	binary.BigEndian.PutUint64(bs, math.Float64bits(v))
-	b.prepare(len(bs))
-	b.WriteBytes(bs)
+	b.prepare(8)
+	binary.BigEndian.PutUint64(b.buf[b.writerIndex:], math.Float64bits(v))
+	b.writerIndex += 8
 	return b
 }
 
@@ -337,42 +437,37 @@ func (b *DefaultByteBuf) WriteInt64LE(v int64) ByteBuf {
 }
 
 func (b *DefaultByteBuf) WriteUInt16LE(v uint16) ByteBuf {
-	bs := make([]byte, 2)
-	binary.LittleEndian.PutUint16(bs, v)
-	b.prepare(len(bs))
-	b.WriteBytes(bs)
+	b.prepare(2)
+	binary.LittleEndian.PutUint16(b.buf[b.writerIndex:], v)
+	b.writerIndex += 2
 	return b
 }
 
 func (b *DefaultByteBuf) WriteUInt32LE(v uint32) ByteBuf {
-	bs := make([]byte, 4)
-	binary.LittleEndian.PutUint32(bs, v)
-	b.prepare(len(bs))
-	b.WriteBytes(bs)
+	b.prepare(4)
+	binary.LittleEndian.PutUint32(b.buf[b.writerIndex:], v)
+	b.writerIndex += 4
 	return b
 }
 
 func (b *DefaultByteBuf) WriteUInt64LE(v uint64) ByteBuf {
-	bs := make([]byte, 8)
-	binary.LittleEndian.PutUint64(bs, v)
-	b.prepare(len(bs))
-	b.WriteBytes(bs)
+	b.prepare(8)
+	binary.LittleEndian.PutUint64(b.buf[b.writerIndex:], v)
+	b.writerIndex += 8
 	return b
 }
 
 func (b *DefaultByteBuf) WriteFloat32LE(v float32) ByteBuf {
-	bs := make([]byte, 4)
-	binary.LittleEndian.PutUint32(bs, math.Float32bits(v))
-	b.prepare(len(bs))
-	b.WriteBytes(bs)
+	b.prepare(4)
+	binary.LittleEndian.PutUint32(b.buf[b.writerIndex:], math.Float32bits(v))
+	b.writerIndex += 4
 	return b
 }
 
 func (b *DefaultByteBuf) WriteFloat64LE(v float64) ByteBuf {
-	bs := make([]byte, 8)
-	binary.LittleEndian.PutUint64(bs, math.Float64bits(v))
-	b.prepare(len(bs))
-	b.WriteBytes(bs)
+	b.prepare(8)
+	binary.LittleEndian.PutUint64(b.buf[b.writerIndex:], math.Float64bits(v))
+	b.writerIndex += 8
 	return b
 }
 
@@ -386,7 +481,10 @@ func (b *DefaultByteBuf) ReadByte() byte {
 }
 
 func (b *DefaultByteBuf) ReadBytes(len int) []byte {
-	if len <= 0 {
+	if len < 0 {
+		panic(ErrInsufficientSize)
+	}
+	if len == 0 {
 		return []byte{}
 	}
 
@@ -409,7 +507,7 @@ func (b *DefaultByteBuf) ReadWriter(writer io.Writer) ByteBuf {
 	n, err := writer.Write(bs)
 	b.ReadBytes(n)
 	if err != nil {
-		panic(ErrInsufficientSize)
+		panic(err)
 	}
 
 	return b
@@ -480,10 +578,12 @@ func (b *DefaultByteBuf) ReadFloat64LE() float64 {
 }
 
 func (b *DefaultByteBuf) prepare(i int) {
+	if i <= 0 {
+		return
+	}
 	if b.Cap() == 0 {
 		b.Grow(32)
 	}
-
 	for b.writerIndex+i > b.Cap() {
 		b.Grow(b.Cap())
 	}
