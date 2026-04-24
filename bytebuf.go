@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"sync/atomic"
 )
 
 // ByteBuf defines a byte buffer interface that is NOT concurrent-safe.
@@ -32,8 +33,10 @@ type ByteBuf interface {
 	Grow(v int) ByteBuf
 	// Compact moves the readable region to the beginning of the buffer and adjusts indices (including marked indices).
 	Compact() ByteBuf
-	// EnsureCapacity guarantees that at least n bytes of writable space are available.
-	// It first tries to compact; if still insufficient, it grows using the existing doubling policy and compacts again.
+	// EnsureCapacity guarantees that at least n bytes of writable space
+	// are available. It compacts when that alone suffices; otherwise it
+	// doubles the capacity to the smallest power-of-two that fits the
+	// required size and compacts the readable region to index 0.
 	EnsureCapacity(n int) ByteBuf
 	Skip(v int) ByteBuf
 	Clone() ByteBuf
@@ -88,26 +91,67 @@ type ByteBuf interface {
 
 var ErrNilObject = errors.New("nil object")
 var ErrInsufficientSize = errors.New("insufficient size")
+var ErrRefCountUnderflow = errors.New("refcount underflow")
+
+// Slicer is implemented by ByteBufs that expose zero-copy view APIs sharing
+// the same backing storage as the parent.
+type Slicer interface {
+	Slice(from, length int) ByteBuf
+	Duplicate() ByteBuf
+	ReadSlice(n int) ByteBuf
+}
+
+// RefCounted is implemented by ByteBufs that participate in reference
+// counted lifecycle management. Fresh buffers start at refcount 1.
+type RefCounted interface {
+	Retain() ByteBuf
+	Release() bool
+	RefCnt() int32
+}
+
+// newDefaultByteBuf constructs a DefaultByteBuf with refcount 1 and a
+// poolIdx of -1 (unpooled).
+func newDefaultByteBuf() *DefaultByteBuf {
+	b := &DefaultByteBuf{poolIdx: -1}
+	b.refcnt.Store(1)
+	return b
+}
 
 func NewByteBuf(bs []byte) ByteBuf {
-	buf := &DefaultByteBuf{}
+	buf := newDefaultByteBuf()
 	buf.WriteBytes(bs)
 	return buf
 }
 
 func NewByteBufString(str string) ByteBuf {
-	buf := &DefaultByteBuf{}
+	buf := newDefaultByteBuf()
 	buf.WriteString(str)
 	return buf
 }
 
 func EmptyByteBuf() ByteBuf {
-	return &DefaultByteBuf{}
+	return newDefaultByteBuf()
+}
+
+// NewSharedByteBuf wraps bs without copying. Writes that fit cap(bs) mutate
+// the original backing array; writes that exceed it detach into a freshly
+// allocated array and leave bs untouched.
+func NewSharedByteBuf(bs []byte) ByteBuf {
+	buf := newDefaultByteBuf()
+	buf.buf = bs
+	buf.writerIndex = len(bs)
+	return buf
 }
 
 type DefaultByteBuf struct {
 	buf                                                        []byte
 	readerIndex, writerIndex, prevReaderIndex, prevWriterIndex int
+	// poolIdx is the sync.Pool size class index this buffer belongs to,
+	// or -1 for unpooled buffers (direct allocation or a view created by
+	// Slice/Duplicate/ReadSlice). ReleaseByteBuf returns to the pool only
+	// when poolIdx >= 0.
+	poolIdx int32
+	refcnt  atomic.Int32
 }
 
 func (b *DefaultByteBuf) Write(p []byte) (n int, err error) {
@@ -162,8 +206,14 @@ func (b *DefaultByteBuf) WriteAt(p []byte, offset int64) (n int, err error) {
 	return pl, nil
 }
 
+// Close drops the backing array and clears all indices so the buffer holds
+// no storage. Cap() returns 0 afterwards.
 func (b *DefaultByteBuf) Close() error {
-	b.Reset()
+	b.buf = nil
+	b.readerIndex = 0
+	b.writerIndex = 0
+	b.prevReaderIndex = 0
+	b.prevWriterIndex = 0
 	return nil
 }
 
@@ -197,8 +247,9 @@ func (b *DefaultByteBuf) ResetWriterIndex() ByteBuf {
 	return b
 }
 
+// Reset clears all indices (reader, writer, and marks) while keeping the
+// backing array. Cap() is unchanged. Use Close to release the backing array.
 func (b *DefaultByteBuf) Reset() ByteBuf {
-	b.buf = []byte{}
 	b.readerIndex = 0
 	b.writerIndex = 0
 	b.prevReaderIndex = 0
@@ -251,8 +302,10 @@ func (b *DefaultByteBuf) Compact() ByteBuf {
 	return b
 }
 
-// EnsureCapacity guarantees that at least n bytes of writable space are available.
-// It first tries to compact; if still insufficient, it grows using the existing doubling policy and compacts again.
+// EnsureCapacity guarantees that at least n bytes of writable space are
+// available. It compacts when that alone suffices; otherwise it doubles
+// the capacity to the smallest power-of-two that fits the required size
+// and compacts the readable region to index 0.
 func (b *DefaultByteBuf) EnsureCapacity(n int) ByteBuf {
 	if n < 0 {
 		panic(ErrInsufficientSize)
@@ -267,15 +320,18 @@ func (b *DefaultByteBuf) EnsureCapacity(n int) ByteBuf {
 	if b.ReadableBytes()+n <= b.Cap() {
 		return b.Compact()
 	}
-	// Need to grow: preserve existing doubling growth policy
+	// Double the capacity until it holds the existing readable region
+	// plus n writable bytes, then reallocate once via growTo which also
+	// compacts the readable region to index 0.
 	required := b.ReadableBytes() + n
-	if b.Cap() == 0 {
-		b.Grow(32)
+	newCap := b.Cap()
+	if newCap == 0 {
+		newCap = 32
 	}
-	for b.Cap() < required {
-		b.Grow(b.Cap())
+	for newCap < required {
+		newCap *= 2
 	}
-	// Grow() already compacts by moving readable bytes to the start; avoid redundant copy.
+	b.growTo(newCap)
 	return b
 }
 
@@ -320,8 +376,19 @@ func (b *DefaultByteBuf) Grow(v int) ByteBuf {
 	return b
 }
 
+// Skip advances readerIndex by v bytes using only index arithmetic. Panics
+// on a negative v or when v exceeds ReadableBytes.
 func (b *DefaultByteBuf) Skip(v int) ByteBuf {
-	b.ReadBytes(v)
+	if v < 0 {
+		panic(ErrInsufficientSize)
+	}
+	if v == 0 {
+		return b
+	}
+	if b.ReadableBytes() < v {
+		panic(ErrInsufficientSize)
+	}
+	b.readerIndex += v
 	return b
 }
 
@@ -332,15 +399,14 @@ func (b *DefaultByteBuf) Clone() ByteBuf {
 		return EmptyByteBuf()
 	}
 
-	clone := &DefaultByteBuf{}
+	clone := newDefaultByteBuf()
 	clone.buf = make([]byte, readable)
 	copy(clone.buf, b.buf[b.readerIndex:b.writerIndex])
 	clone.writerIndex = readable
-	// readerIndex is already 0, prevReaderIndex and prevWriterIndex are already 0
 	return clone
 }
 
-// AppendByte appends a single byte and returns the ByteBuf for chaining (renamed from WriteByte)
+// AppendByte appends a single byte and returns the ByteBuf for chaining.
 func (b *DefaultByteBuf) AppendByte(c byte) ByteBuf {
 	b.prepare(1)
 	b.buf[b.writerIndex] = c
@@ -373,17 +439,22 @@ func (b *DefaultByteBuf) WriteByteBuf(buf ByteBuf) ByteBuf {
 	return b
 }
 
+// writeReaderChunk is the minimum writable tail WriteReader keeps available
+// before handing the underlying slice to reader.Read.
+const writeReaderChunk = 4 * 1024
+
 func (b *DefaultByteBuf) WriteReader(reader io.Reader) ByteBuf {
 	if reader == nil {
 		panic(ErrNilObject)
 	}
 
-	// Chunked copy to avoid unbounded memory growth
-	tmp := make([]byte, 32*1024)
 	for {
-		n, err := reader.Read(tmp)
+		if b.Cap()-b.writerIndex < writeReaderChunk {
+			b.prepare(writeReaderChunk)
+		}
+		n, err := reader.Read(b.buf[b.writerIndex:b.Cap()])
 		if n > 0 {
-			b.WriteBytes(tmp[:n])
+			b.writerIndex += n
 		}
 		if err == io.EOF {
 			break
@@ -547,7 +618,7 @@ func (b *DefaultByteBuf) ReadBytes(len int) []byte {
 }
 
 func (b *DefaultByteBuf) ReadByteBuf(len int) ByteBuf {
-	buf := &DefaultByteBuf{}
+	buf := newDefaultByteBuf()
 	buf.WriteBytes(b.ReadBytes(len))
 	return buf
 }
@@ -687,14 +758,117 @@ func (b *DefaultByteBuf) ReadFloat64LE() float64 {
 	return result
 }
 
+// prepare guarantees at least i more writable bytes at writerIndex, doubling
+// the capacity in a single reallocation and compacting the readable region
+// to the start when a new backing array is needed.
 func (b *DefaultByteBuf) prepare(i int) {
 	if i <= 0 {
 		return
 	}
-	if b.Cap() == 0 {
-		b.Grow(32)
+	required := b.writerIndex + i
+	if required <= b.Cap() {
+		return
 	}
-	for b.writerIndex+i > b.Cap() {
-		b.Grow(b.Cap())
+
+	newCap := b.Cap()
+	if newCap == 0 {
+		newCap = 32
 	}
+	for newCap < required {
+		newCap *= 2
+	}
+
+	b.growTo(newCap)
+}
+
+// growTo reallocates the backing array to newCap and compacts the active
+// region (from the oldest preserved index) to the start. Marked indices are
+// adjusted so they remain valid after the move.
+func (b *DefaultByteBuf) growTo(newCap int) {
+	var offset int
+	if b.prevReaderIndex == 0 {
+		offset = b.readerIndex
+	} else {
+		offset = b.prevReaderIndex
+		b.prevReaderIndex = 0
+	}
+
+	activeSize := b.writerIndex - offset
+	tb := make([]byte, newCap)
+	if activeSize > 0 {
+		copy(tb, b.buf[offset:b.writerIndex])
+	}
+
+	b.readerIndex -= offset
+	b.writerIndex -= offset
+	if b.prevWriterIndex > 0 {
+		b.prevWriterIndex -= offset
+	}
+	b.buf = tb
+}
+
+// Slice returns a view that shares the backing array with b. The view
+// starts at the given offset within b's readable region and covers length
+// bytes. Mutations through the view within its capacity are visible to b.
+// A write that needs to grow beyond the initial capacity allocates a fresh
+// backing array inside the view and detaches it from b.
+func (b *DefaultByteBuf) Slice(from, length int) ByteBuf {
+	if from < 0 || length < 0 || from+length > b.ReadableBytes() {
+		panic(ErrInsufficientSize)
+	}
+	start := b.readerIndex + from
+	s := newDefaultByteBuf()
+	s.buf = b.buf[start : start+length]
+	s.writerIndex = length
+	return s
+}
+
+// Duplicate returns a ByteBuf that shares b's backing array but keeps its
+// own reader, writer, and mark indices. Writes that fit within the shared
+// capacity are visible to b; writes that grow detach the duplicate.
+func (b *DefaultByteBuf) Duplicate() ByteBuf {
+	d := newDefaultByteBuf()
+	d.buf = b.buf
+	d.readerIndex = b.readerIndex
+	d.writerIndex = b.writerIndex
+	return d
+}
+
+// ReadSlice advances readerIndex by n and returns a zero-copy view over the
+// consumed bytes. The returned view shares b's backing array.
+func (b *DefaultByteBuf) ReadSlice(n int) ByteBuf {
+	if n < 0 {
+		panic(ErrInsufficientSize)
+	}
+	if b.ReadableBytes() < n {
+		panic(ErrInsufficientSize)
+	}
+	start := b.readerIndex
+	b.readerIndex += n
+	s := newDefaultByteBuf()
+	s.buf = b.buf[start : start+n]
+	s.writerIndex = n
+	return s
+}
+
+// Retain increments the reference count and returns the buffer for chaining.
+func (b *DefaultByteBuf) Retain() ByteBuf {
+	b.refcnt.Add(1)
+	return b
+}
+
+// Release decrements the reference count. It returns true when the counter
+// reaches zero, at which point the caller owns the final drop. Panics on
+// underflow.
+func (b *DefaultByteBuf) Release() bool {
+	n := b.refcnt.Add(-1)
+	if n < 0 {
+		panic(ErrRefCountUnderflow)
+	}
+	return n == 0
+}
+
+// RefCnt returns the current reference count.
+func (b *DefaultByteBuf) RefCnt() int32 {
+	return b.refcnt.Load()
 }

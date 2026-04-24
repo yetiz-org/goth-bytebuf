@@ -7,6 +7,8 @@ import (
 	"testing"
 )
 
+var benchmarkBytesSink []byte
+
 // Benchmark Write Operations
 func BenchmarkAppendByte(b *testing.B) {
 	buf := EmptyByteBuf()
@@ -145,26 +147,28 @@ func BenchmarkReadByte(b *testing.B) {
 
 func BenchmarkReadBytes_Small(b *testing.B) {
 	buf := EmptyByteBuf()
-	// Pre-populate buffer
-	totalData := bytes.Repeat([]byte("hello"), b.N)
-	buf.WriteBytes(totalData)
+	data := []byte("hello")
+	buf.WriteBytes(data)
 
+	b.SetBytes(int64(len(data)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		buf.ReadBytes(5)
+		buf.(*DefaultByteBuf).readerIndex = 0
+		benchmarkBytesSink = buf.ReadBytes(len(data))
 	}
 }
 
 func BenchmarkReadBytes_Medium(b *testing.B) {
 	buf := EmptyByteBuf()
-	// Pre-populate buffer
 	chunkSize := 1024
-	totalData := bytes.Repeat([]byte("x"), b.N*chunkSize)
-	buf.WriteBytes(totalData)
+	data := bytes.Repeat([]byte("x"), chunkSize)
+	buf.WriteBytes(data)
 
+	b.SetBytes(int64(chunkSize))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		buf.ReadBytes(chunkSize)
+		buf.(*DefaultByteBuf).readerIndex = 0
+		benchmarkBytesSink = buf.ReadBytes(chunkSize)
 	}
 }
 
@@ -280,8 +284,11 @@ func BenchmarkClone(b *testing.B) {
 func BenchmarkWriteBytes_1MB(b *testing.B) {
 	buf := EmptyByteBuf()
 	data := bytes.Repeat([]byte("x"), 1024*1024) // 1MB
+	buf.EnsureCapacity(len(data))
+	b.SetBytes(int64(len(data)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		buf.Reset()
 		buf.WriteBytes(data)
 	}
 }
@@ -289,8 +296,11 @@ func BenchmarkWriteBytes_1MB(b *testing.B) {
 func BenchmarkWriteBytes_10MB(b *testing.B) {
 	buf := EmptyByteBuf()
 	data := bytes.Repeat([]byte("x"), 10*1024*1024) // 10MB
+	buf.EnsureCapacity(len(data))
+	b.SetBytes(int64(len(data)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		buf.Reset()
 		buf.WriteBytes(data)
 	}
 }
@@ -298,12 +308,14 @@ func BenchmarkWriteBytes_10MB(b *testing.B) {
 func BenchmarkReadBytes_1MB(b *testing.B) {
 	buf := EmptyByteBuf()
 	chunkSize := 1024 * 1024 // 1MB
-	totalData := bytes.Repeat([]byte("x"), b.N*chunkSize)
-	buf.WriteBytes(totalData)
+	data := bytes.Repeat([]byte("x"), chunkSize)
+	buf.WriteBytes(data)
 
+	b.SetBytes(int64(chunkSize))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		buf.ReadBytes(chunkSize)
+		buf.(*DefaultByteBuf).readerIndex = 0
+		benchmarkBytesSink = buf.ReadBytes(chunkSize)
 	}
 }
 
@@ -385,13 +397,12 @@ func BenchmarkBytesBuffer_WriteString_Medium(b *testing.B) {
 }
 
 func BenchmarkBytesBuffer_Read_Small(b *testing.B) {
-	var buf bytes.Buffer
-	totalData := bytes.Repeat([]byte("hello"), b.N)
-	buf.Write(totalData)
-
+	data := []byte("hello")
 	readBuf := make([]byte, 5)
+	b.SetBytes(int64(len(data)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		buf := bytes.NewBuffer(data)
 		buf.Read(readBuf)
 	}
 }
@@ -408,13 +419,16 @@ func BenchmarkIOInterface_Write(b *testing.B) {
 
 func BenchmarkIOInterface_Read(b *testing.B) {
 	buf := EmptyByteBuf()
-	totalData := bytes.Repeat([]byte("hello world"), b.N)
-	buf.WriteBytes(totalData)
+	data := []byte("hello world")
+	buf.WriteBytes(data)
+	dbuf := buf.(*DefaultByteBuf)
 
 	var r io.Reader = buf
 	readBuf := make([]byte, 11)
+	b.SetBytes(int64(len(data)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
+		dbuf.readerIndex = 0
 		r.Read(readBuf)
 	}
 }
